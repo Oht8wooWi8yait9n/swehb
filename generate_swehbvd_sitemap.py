@@ -19,18 +19,25 @@ HEADERS = {
 }
 
 
-def fetch_children(session: requests.Session, page_id: str, retries: int = 3):
+def fetch_children(session: requests.Session, page_id: str, retries: int = 5):
     url = f"{BASE_URL}/pages/children.action?pageId={page_id}"
     for attempt in range(retries):
         try:
-            r = session.get(url, timeout=15)
+            r = session.get(url, timeout=20)
             if r.status_code == 200:
-                return r.json()
+                return r.json(), True
             elif r.status_code == 429:
-                time.sleep(2 * (attempt + 1))
-        except Exception:
-            time.sleep(1)
-    return []
+                sleep_time = 3 * (attempt + 1)
+                print(f"    [!] Rate limited (429) on pageId {page_id}. Sleeping {sleep_time}s...")
+                time.sleep(sleep_time)
+            else:
+                time.sleep(2 ** attempt)
+        except Exception as e:
+            sleep_time = 2 ** attempt
+            print(f"    [!] Error fetching pageId {page_id} (attempt {attempt+1}/{retries}): {e}. Retrying in {sleep_time}s...")
+            time.sleep(sleep_time)
+    print(f"    [ERROR] Failed to fetch children for pageId {page_id} after {retries} attempts.")
+    return [], False
 
 
 def main():
@@ -41,6 +48,7 @@ def main():
     visited_pages = set()
     to_visit = [ROOT_PAGE_ID]
     all_urls = set()
+    failed_nodes = []
 
     # Known top-level entrypoints
     landing_paths = [
@@ -64,7 +72,10 @@ def main():
             continue
         visited_pages.add(current_id)
 
-        children = fetch_children(session, current_id)
+        children, success = fetch_children(session, current_id)
+        if not success:
+            failed_nodes.append(current_id)
+
         for child in children:
             cid = child.get("pageId")
             href = child.get("href")
@@ -80,6 +91,17 @@ def main():
 
     sorted_urls = sorted(list(all_urls))
     print(f"[+] Crawl complete! Discovered {len(sorted_urls)} total pages in Rev D.")
+
+    # Guard: Do not allow partial crawls or dropped branches to overwrite the sitemap
+    if failed_nodes:
+        print(f"[!] ERROR: {len(failed_nodes)} nodes failed to load during crawl: {failed_nodes}")
+        print("[!] Aborting to prevent publishing a truncated sitemap.")
+        sys.exit(1)
+
+    if len(sorted_urls) < 1200:
+        print(f"[!] ERROR: Discovered only {len(sorted_urls)} URLs (expected >= 1,200).")
+        print("[!] Aborting to prevent publishing a truncated sitemap.")
+        sys.exit(1)
 
     out_sitemap = "swehbvd_sitemap.xml"
     out_txt = "swehbvd_urls.txt"
@@ -101,3 +123,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
