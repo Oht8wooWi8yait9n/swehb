@@ -31,7 +31,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add swehbvd_sitemap.xml swehbvd_urls.txt
+          git add swehbvd_sitemap.xml swehbvd_urls.txt swehbvd_cache.json
           if git diff --staged --quiet; then
             echo "No changes detected in SWEHB Revision D pages."
           else
