@@ -72,6 +72,21 @@ def fetch_children(session_holder, page_id: str, retries: int = 5):
     return [], False
 
 
+def is_branch_node(child: dict, cache: dict) -> bool:
+    """
+    Determine if a Confluence child node is an expandable branch container.
+    Confluence explicitly marks expandable branch containers with 'closed' in nodeClass.
+    Leaf nodes have ' undraggable' without 'closed'.
+    We also consult the tree cache as a fallback guard.
+    """
+    if "closed" in child.get("nodeClass", "").lower():
+        return True
+    cid = child.get("pageId")
+    if cid and cid in cache and len(cache[cid]) > 0:
+        return True
+    return False
+
+
 def main():
     print(f"[*] Starting crawl of NASA SWEHB Rev D ({SPACE_KEY})...")
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -113,6 +128,7 @@ def main():
     all_urls.add(f"{BASE_URL}{root_href}")
 
     count = 0
+    start_time = time.time()
     while to_visit:
         current_id = to_visit.pop(0)
         if current_id in visited_pages:
@@ -122,6 +138,12 @@ def main():
         children, success = fetch_children(session_holder, current_id)
         if not success:
             failed_nodes.add(current_id)
+            # Immediate in-flight cache fallback so descendant branches aren't blocked
+            if current_id in tree_cache:
+                print(f"    [!] In-flight cache fallback for node {current_id} ({len(tree_cache[current_id])} children)")
+                children = tree_cache[current_id]
+            else:
+                children = []
         else:
             updated_cache[current_id] = children
 
@@ -131,21 +153,23 @@ def main():
             if href:
                 full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
                 all_urls.add(full_url)
-            if cid and cid not in visited_pages:
+            # Only queue branch nodes with children (avoids 960+ redundant requests for leaf nodes)
+            if cid and cid not in visited_pages and is_branch_node(child, tree_cache):
                 to_visit.append(cid)
 
         count += 1
-        if count % 50 == 0:
-            print(f"    Crawled {count} nodes... Discovered {len(all_urls)} URLs so far.")
+        if count % 25 == 0:
+            print(f"    Crawled {count} branch nodes... Discovered {len(all_urls)} URLs so far.")
 
-        # Respectful delay between requests
         time.sleep(REQUEST_DELAY_SEC)
+
+    elapsed_p1 = time.time() - start_time
+    print(f"[+] Completed Phase 1 crawl ({count} branch nodes) in {elapsed_p1:.1f}s.")
 
     # Secondary Pass: retry failed nodes with longer cooldown
     if failed_nodes:
         print(f"\n[*] Re-attempting {len(failed_nodes)} failed nodes in Phase 2 cooldown pass...")
-        time.sleep(5.0)
-        still_failed = []
+        time.sleep(3.0)
         for fid in list(failed_nodes):
             children, success = fetch_children(session_holder, fid, retries=3)
             if success:
@@ -155,29 +179,50 @@ def main():
                     cid = child.get("pageId")
                     href = child.get("href")
                     if href:
-                        full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
-                        all_urls.add(full_url)
-                    if cid and cid not in visited_pages:
-                        visited_pages.add(cid)
+                        all_urls.add(href if href.startswith("http") else f"{BASE_URL}{href}")
+                    if cid and cid not in visited_pages and is_branch_node(child, tree_cache):
                         to_visit.append(cid)
             else:
-                still_failed.append(fid)
-            time.sleep(0.5)
+                if fid in tree_cache:
+                    print(f"    [!] Retaining cache for node {fid} ({len(tree_cache[fid])} children)")
+                    updated_cache[fid] = tree_cache[fid]
+                    for child in tree_cache[fid]:
+                        cid = child.get("pageId")
+                        href = child.get("href")
+                        if href:
+                            all_urls.add(href if href.startswith("http") else f"{BASE_URL}{href}")
+                        if cid and cid not in visited_pages and is_branch_node(child, tree_cache):
+                            to_visit.append(cid)
+                else:
+                    print(f"    [ERROR] Node {fid} could not be resolved or found in cache.")
+            time.sleep(0.3)
 
-        # Fallback to cache for any nodes that still failed
-        for fid in still_failed:
-            if fid in tree_cache:
-                print(f"    [!] Fallback to cache for node {fid} ({len(tree_cache[fid])} children)")
-                cached_children = tree_cache[fid]
-                updated_cache[fid] = cached_children
-                for child in cached_children:
+        # Drain any newly discovered branch nodes queued during recovery
+        while to_visit:
+            current_id = to_visit.pop(0)
+            if current_id in visited_pages:
+                continue
+            visited_pages.add(current_id)
+            children, success = fetch_children(session_holder, current_id, retries=3)
+            if success:
+                updated_cache[current_id] = children
+                for child in children:
                     cid = child.get("pageId")
                     href = child.get("href")
                     if href:
-                        full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
-                        all_urls.add(full_url)
-            else:
-                print(f"    [ERROR] Node {fid} could not be resolved or found in cache.")
+                        all_urls.add(href if href.startswith("http") else f"{BASE_URL}{href}")
+                    if cid and cid not in visited_pages and is_branch_node(child, tree_cache):
+                        to_visit.append(cid)
+            elif current_id in tree_cache:
+                updated_cache[current_id] = tree_cache[current_id]
+                for child in tree_cache[current_id]:
+                    cid = child.get("pageId")
+                    href = child.get("href")
+                    if href:
+                        all_urls.add(href if href.startswith("http") else f"{BASE_URL}{href}")
+                    if cid and cid not in visited_pages and is_branch_node(child, tree_cache):
+                        to_visit.append(cid)
+            time.sleep(REQUEST_DELAY_SEC)
 
     # Save updated tree cache
     if updated_cache:
@@ -190,7 +235,8 @@ def main():
             print(f"[!] Warning: Could not save tree cache: {e}")
 
     sorted_urls = sorted(list(all_urls))
-    print(f"\n[+] Crawl complete! Discovered {len(sorted_urls)} total pages in Rev D.")
+    total_elapsed = time.time() - start_time
+    print(f"\n[+] Crawl complete in {total_elapsed:.1f}s! Discovered {len(sorted_urls)} total pages in Rev D.")
 
     # Validation check: require at least 1,200 URLs
     if len(sorted_urls) < 1200:
